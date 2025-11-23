@@ -1,0 +1,612 @@
+---
+title: "analysis"
+author: "sjgknight"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyr,
+               magrittr,
+               dplyr,
+               tibble,
+               wikkitidy, 
+               reactable,
+               reactablefmtr)
+
+custom <- list.files(here::here('R/'),full.names = T)
+
+purrr::quietly(
+  lapply(custom, source)
+)
+
+rm(custom)
+
+```
+
+## Queries
+
+```{r define_queries}
+
+# ==============================================================================
+# Params
+# ==============================================================================
+
+prepend <- c("WP:", "Wikipedia:")
+
+namespace <- "1" # article is 0, talk is 2, https://en.wikipedia.org/wiki/Wikipedia:Namespace
+
+articles <- c("Origin of SARS-CoV-2",
+              "COVID-19 drug repurposing research",
+              "COVID-19",
+              "Face masks during the COVID-19 pandemic")
+
+format = "json"
+
+policies_core <- c("MEDRS",
+                   "NOTRS", 
+                   "SPS", 
+                   "BLOGS",
+                   "QUESTIONABLE", 
+                   "QUESTIONED", 
+                   "SPONSOR", 
+                   "SPONSORED", 
+                   "USERG", 
+                   "UGC", 
+                   "USERGENERATED", 
+                   "QS", 
+                   "NOR", 
+                   "NPOV", 
+                   "DUE", 
+                   "MEDSCI", 
+                   "MEDPOP", 
+                   "MEDORG",
+                   "BIO", 
+                   "MEDASSESS",
+                   "CONSENSUS",
+                   "FALSEBALANCE", 
+                   "FRINGELEVEL",
+                   "FRINGE", 
+                   "SCIRS", 
+                   "MEDFAQ", 
+                   "RS",
+                   "RSUW",
+                   "EVALFRINGE",
+                   "DESCF", 
+                   "FDESC", 
+                   "PROFRINGE", 
+                   "RSP",
+                   "RS/P",
+                   "RSPS",
+                   "CIR",
+                   "COMPETENCE",
+                   "PARITY")
+  
+
+# ==============================================================================
+# BUILD SEARCH QUERIES
+# ==============================================================================
+
+# assemble your OR conditions
+policy_terms <- paste(paste0("WP:", policies_core), paste0("Wikipedia:", policies_core), collapse = " OR ", sep = " OR ")
+
+policy_and_page <- paste(policy_terms, 
+                         paste0("prefix:\"", "Talk:", articles, "\""), 
+                         sep = " ")
+
+
+# ==============================================================================
+# STEP 1: RUN INITIAL SEARCH
+# ==============================================================================
+
+if(file.exists("output/wikipedia_raw_results.rds")){
+  message("Loaded existing raw results from output/wikipedia_raw_results.rds")
+  
+  results <- readRDS("output/wikipedia_raw_results.rds")
+
+} else {
+  message("No existing raw results found, proceeding to run queries.")
+
+  results <- purrr::map_dfr(policy_and_page,
+                          ~ wiki_get_query(
+                            policy_and_page_string = .x,
+                            namespace = 1,
+                            srlimit = 50,
+                            max_len = 280
+                            ) # %>%
+        #mutate(original_query = .x)  # add a column with the policy_and_page string
+  )
+  saveRDS(results, "output/wikipedia_raw_results.rds")
+}
+
+# ==============================================================================
+# ==============================================================================
+# Get full content and save it
+# ==============================================================================
+# ==============================================================================
+
+if(file.exists("output/wikipedia_full_results.rds")){
+  message("Loaded existing highlighted results from output/wikipedia_highlighted_results.rds")
+  
+  results_with_content <- readRDS("output/wikipedia_full_results.rds")
+
+} else {
+  message("No existing highlighted results found, proceeding to create full content.")
+  
+  # ==============================================================================
+  # STEP 2: GET SECTION INDICES and Content for sections if available, else pages
+  # ==============================================================================
+  
+  results_with_content <- results %>%
+    mutate(
+      # Step 3a: fetch section index (if sectiontitle exists)
+      section_index = map2_chr(pageid, sectiontitle, ~ {
+        if (is.na(.y)) return(NA_character_)
+        secs <- wiki_get_structure(.x)
+        matched <- secs$index[secs$line == .y]
+        if (length(matched) == 0) NA_character_ else matched
+      })
+    )
+  
+  # ==============================================================================
+  # STEP 3: FETCH HTML CONTENT and Wikitext
+  # ==============================================================================
+  results_with_content <- results_with_content %>%
+    mutate(
+      content_html = map2_chr(pageid, section_index, ~ {
+        wiki_get_html(.x, if (is.na(.y) || .y == "") NULL else .y)
+      })
+    )
+  
+  results_with_content <- results_with_content %>%
+    mutate(
+      # Step 3b: fetch page content (whole page if section_index is NA)
+      content = if(any(is.na(section_index), section_index == "")) {
+                     map_chr(pageid, ~ wiki_get_wikitext(.x)$content)
+      } else {
+        map2_chr(pageid, section_index, ~ wiki_get_wikitext(.x, if (.y == "") NULL else .y)$content)
+      }
+  )
+  
+  # results_with_content <- results_with_content %>%
+  #   mutate(
+  #     content_html = map_chr(content, ~ 
+  #                              wikitext_to_html(.x)
+  #     ))
+  
+  # ==============================================================================
+  # STEP 4: EXTRACT WP POLICIES
+  # ==============================================================================
+  
+  
+  results_with_content <- results_with_content %>%
+    mutate(
+      wp_policies = map(content_html, wiki_extract_policies),
+      num_policies = map_int(wp_policies, length)
+    )
+  
+  message(sprintf("Extracted policies from %d pages", 
+                  sum(results_with_content$num_policies > 0)))
+  
+  # ==============================================================================
+  # STEP 5: HIGHLIGHT SEARCH TERMS
+  # ==============================================================================
+  
+  results_with_content <- results_with_content %>%
+    mutate(
+       content_html = wikipolicy_mark(content_html, policies_core)
+       ) %>%
+    mutate(content_html = str_replace_all(
+      content_html,
+      'href=["\'](?!https?:|mailto:|#)/?([^"\']+)["\']',
+      'href="https://wikipedia.org/\\1"')
+  )
+
+   # ==============================================================================
+  # Save output
+  # ==============================================================================
+  
+  saveRDS(results_with_content, "output/wikipedia_full_results.rds")
+
+}
+
+  
+# ==============================================================================
+# STEP 6: Filter: Remove duplicate pages (where multiple policies trigger), and remove from html content without policies
+# ==============================================================================
+
+if(file.exists("output/wikipedia_filtered_results.rds")){
+  results_filtered_content <- readRDS("output/wikipedia_filtered_results.rds")
+  message("Loaded existing filtered results from output/wikipedia_filtered_results.rds")
+} else {
+  message("No existing filtered results found, proceeding to create new filtered results.")
+  
+  # Apply filtering
+results_filtered_content <- results_with_content %>%
+  select(title, timestamp, pageid, sectiontitle, content_html, wp_policies, num_policies) %>%
+  unique()
+
+# Here idea was to remove sections that aren't relevant but it turned out harder than I wanted
+
+# results_filtered_content <- results_filtered_content %>%
+#    mutate(
+#      content_filtered = wiki_filter_text(content_html)
+#    )
+
+saveRDS(results_filtered_content, "output/wikipedia_filtered_results.rds")
+
+}
+
+
+
+
+```
+
+## Policy pieces
+
+```{r policyextraction}
+
+
+# ==============================================================================
+# EXTRACT 1: Policy hierarchy to get unique policies and their sub-policy shortcuts
+# ==============================================================================
+if(file.exists("output/policy_result.rds")){
+  message("Loaded existing policy hierarchy from output/policy_hierarchy.rds")
+  
+  policy_use <- readRDS("output/policy_result.rds")
+
+} else {
+  message("No existing policy hierarchy found, proceeding to create new hierarchy.")
+
+  policy_use <- paste("WP:",policies_core) %>% 
+    stringr::str_remove(" ") %>%
+    build_policy_hierarchy(include_referenced = TRUE, max_depth = 1)
+  
+  readr::write_rds(policy_use, "output/policy_result.rds")
+
+}
+
+
+# ==============================================================================
+# EXTRACT 2: Policies and subpolicies
+# ==============================================================================
+
+if(file.exists("output/policy_pages_nested.rds")){
+  message("Loaded existing nested policy pages from output/policy_pages_nested.rds")
+  
+  policy_pages_nested <- readRDS("output/policy_pages_nested.rds")
+
+  all_subpolicies <- readr::read_rds("output/all_subpolicies.rds")
+
+} else {
+  message("No existing nested policy pages found, proceeding to create new nested structure.")
+  
+  # Step 1: Extract heading-to-shortcut mappings (nested structure)
+  policy_pages_nested <- policy_use %>%
+    mutate(
+      # Extract shortcuts mapped to headings for each page
+      shortcut_sections = map2(wikitext, page_title, 
+                               ~wiki_extract_title(.x, page_title = .y) %>%
+                                 select(-line_num) %>%
+                                 unique()
+      )
+    )
+  
+  # Step 2: Get section structure for pages (if not already present)
+  if (!"sections" %in% names(policy_pages_nested)) {
+    policy_pages_nested <- policy_pages_nested %>%
+      mutate(sections = map(pageid, wiki_get_structure))
+  }
+  
+  
+  # Step 3: Create nested structure with all sections and their shortcuts
+  policy_pages_nested <- policy_pages_nested %>%
+    mutate(
+      sections_with_shortcuts = pmap(list(sections, shortcut_sections), function(sects, shortcts) {
+        # Expand sections
+        section_df <- tibble(
+          index = sects$index,
+          line = sects$line
+        )
+        
+        # If no shortcuts found, return sections with empty shortcuts
+        if (is.null(shortcts) || nrow(shortcts) == 0) {
+          return(section_df %>% mutate(shortcuts = list(character(0))))
+        }
+        
+        # Join sections with shortcuts
+        section_df %>%
+          left_join(shortcts, by = c("line" = "heading")) %>%
+          group_by(index, line) %>%
+          summarise(
+            shortcuts = list(na.omit(unique(shortcuts))),
+            .groups = "drop"
+          )
+      })
+    ) %>%
+    select(pageid, page_title, self_shortcuts, sections_with_shortcuts)
+
+    readr::write_rds(policy_pages_nested, "output/policy_pages_nested.rds")
+
+    
+  # Step 5: Expand and join to get policy parts
+  all_subpolicies <- policy_pages_nested %>%
+    select(pageid, page_title, sections_with_shortcuts) %>%
+    unnest(sections_with_shortcuts) %>%
+    # Filter to only sections with child shortcuts (or keep all if you want)
+    dplyr::filter(length(shortcuts) > 0) %>%
+    # Extract HTML content for each section
+    mutate(
+      policy_part = map2_chr(pageid, index, ~{
+        wiki_get_html(.x, if (is.na(.y) || .y == "") NULL else .y)
+      })
+    ) 
+  
+    readr::write_rds(all_subpolicies, "output/all_subpolicies.rds")
+}
+
+  
+
+```
+
+
+## Analysis
+
+```{r thanksclaude}
+
+# Create a shared resources directory
+shared_libdir <- "output/reactable_libs"
+
+# ==============================================================================
+# ANALYSIS 1: Table of article talk page content
+# ==============================================================================
+
+message("\n=== Creating Main Interactive Table ===\n")
+
+table_talk <- results_filtered_content %>% 
+#    dplyr::filter(content_filtered != "") %>%
+    dplyr::mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC")) %>%
+    dplyr::filter(timestamp < "2023-12-31T23:59:59Z") %>%
+    create_interactive_table(displaytext = content_html)
+
+# export large html object
+# Save tables using shared library directory
+htmlwidgets::saveWidget(
+  widget = table_talk,
+  file = "output/table_talk.html",
+  selfcontained = FALSE,
+  libdir = shared_libdir
+)
+
+
+# ==============================================================================
+# ANALYSIS 2: Table of policy content
+# ==============================================================================
+
+# Create summary reactable
+table_policy <- all_subpolicies %>%
+  select(page_title, line, shortcuts, policy_part) %>%
+  reactable(
+    columns = list(
+      page_title = colDef(
+        name = "Page",
+        html = TRUE,
+        cell = function(value, index) {
+          pageid <- all_subpolicies$pageid[index]
+          sprintf('<a href="https://en.wikipedia.org/?curid=%s" target="_blank">%s</a>',
+                  pageid, value)
+        }
+      ),
+      line = colDef(name = "Section"),
+      index = colDef(name = "Index"),
+      child_shortcuts = colDef(show = FALSE),
+      child_shortcuts_str = colDef(
+        name = "Shortcuts",
+        html = TRUE,
+        filterable = TRUE
+      ),
+      policy_part = colDef(
+        name = "Policy Section",
+        html = TRUE,
+        minWidth = 800,
+        cell = function(value, index) {
+          sprintf('
+            <div class="content-container">
+              <button onclick="this.nextElementSibling.classList.toggle(\'collapsed\')"
+                      style="margin-bottom: 6px; padding: 3px 6px; cursor: pointer;">
+                Toggle Section
+              </button>
+              <div class="content-box"
+                   style="max-height: 350px; overflow-y: auto; border: 1px solid #ccc; padding: 10px;">
+                %s
+              </div>
+            </div>
+            <style>.collapsed { display: none; }</style>
+          ', value)
+        }
+      )
+    ),
+
+    defaultPageSize = 200,
+    pagination = TRUE,
+    highlight = TRUE,
+    compact = TRUE,
+    filterable = TRUE,
+    searchable = TRUE,
+    defaultColDef = colDef(
+      align = "left",
+      headerStyle = list(background = "#f7f7f8")
+    )
+  )
+
+
+# export large html object
+htmlwidgets::saveWidget(
+  widget = table_policy,
+  file = "output/table_policy.html",
+  selfcontained = FALSE,
+  libdir = shared_libdir
+)
+
+# ==============================================================================
+# ANALYSIS 3: POLICY SUMMARY TABLE
+# ==============================================================================
+
+# Basic summary
+summary <- create_policy_summary(results_filtered_content)
+
+# Detailed analysis
+detailed <- create_detailed_policy_summary(results_filtered_content)
+detailed$overall
+detailed$by_article
+detailed$policy_cooccurrence
+
+# Filter to only your searched policies
+core_only <- filter_core_policies(summary, policies_core)
+
+# Create summary reactable
+table_policy_summary <- reactable(
+  summary,
+  columns = list(
+    Policy = colDef(
+      name = "Wikipedia Policy", 
+      minWidth = 200,
+      style = list(fontWeight = "500")
+    ),
+    Count = colDef(
+      name = "Usage Count", 
+      width = 150,
+      style = list(fontWeight = "bold"),
+      cell = function(value) {
+        # Add bar chart visualization
+        width <- paste0(value * 100 / max(policy_summary$Count), "%")
+        bar_chart <- sprintf(
+          '<div style="background: #e0e0e0; width: 100%%; height: 20px; border-radius: 3px;">
+             <div style="background: #3498db; width: %s; height: 100%%; border-radius: 3px;"></div>
+           </div>
+           <span style="margin-left: 5px;">%d</span>',
+          width, value
+        )
+        bar_chart
+      },
+      html = TRUE
+    )
+  ),
+  searchable = TRUE,
+  defaultPageSize = 20,
+  highlight = TRUE,
+  bordered = TRUE,
+  striped = TRUE,
+  defaultColDef = colDef(
+    headerStyle = list(background = "#f7f7f8", fontWeight = "bold")
+  )
+)
+
+# export large html object
+htmlwidgets::saveWidget(
+  widget = table_policy_summary,
+  file = "output/table_policy_summary.html",
+  selfcontained = FALSE,
+  libdir = shared_libdir
+)
+
+# ==============================================================================
+# ANALYSIS 4: ADDITIONAL STATISTICS
+# ==============================================================================
+
+message("\n=== Additional Statistics ===\n")
+
+# Articles by number of policy references
+article_stats <- results_filtered_content %>%
+  mutate(article = str_extract(title, "(?<=Talk:)[^/]+")) %>%
+  group_by(article) %>%
+  summarise(
+    n_edits = n_distinct(pageid),
+    total_policies = sum(num_policies),
+    avg_policies_per_pagestate = mean(num_policies),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_policies))
+
+print(article_stats)
+
+# Most common policy combinations
+policy_combinations <- results_filtered_content %>%
+  filter(num_policies >= 2) %>%
+  mutate(
+    policy_combo = map_chr(wp_policies, ~ paste(sort(.x), collapse = " + "))
+  ) %>%
+  count(policy_combo, sort = TRUE) %>%
+  head(10)
+
+message("\nTop 10 Policy Combinations:")
+print(policy_combinations)
+
+# ==============================================================================
+# OUTPUT TABLES
+# ==============================================================================
+
+message("\n" , strrep("=", 80))
+message("DISPLAYING RESULTS")
+message(strrep("=", 80), "\n")
+
+# Display summary table
+message("1. POLICY USAGE SUMMARY\n")
+summary_table
+
+# Display main table
+message("\n2. DETAILED TALK PAGE ANALYSIS\n")
+main_table
+
+
+# ==============================================================================
+# EXPORT OPTIONS (optional)
+# ==============================================================================
+
+write.csv(policy_summary, "output/policy_summary.csv", row.names = FALSE)
+write.csv(article_stats, "output/article_statistics.csv", row.names = FALSE)
+
+message("\n✓ Analysis complete!")
+
+
+```
+
+
+
+```{r table}
+pacman::p_load(reactable)
+
+results_with_content %>%
+  dplyr::filter(timestamp < "2023-12-31T23:59:59Z") %>%
+  select(title, pageid, content_html) %>%
+  reactable(
+  columns = list(
+    pageid = colDef(name = "Page ID"),
+    title = colDef(
+      name = "Title",
+      cell = function(value, index) {
+        # Make the title a clickable link to the Wikipedia page
+        sprintf('<a href="https://en.wikipedia.org/?curid=%s" target="_blank">%s</a>',
+                results_with_content$pageid[index], value)
+      },
+      html = TRUE
+    ),
+    content_html = colDef(
+      name = "Content",
+      html = TRUE,
+      width = 900
+    )
+  ),
+  searchable = TRUE,
+  filterable = TRUE,
+  pagination = TRUE,
+  defaultPageSize = 150,
+  highlight = TRUE,
+  compact = TRUE
+)
+
+
+```
