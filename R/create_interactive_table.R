@@ -71,128 +71,130 @@ generate_policy_css <- function(
   return(css)
 }
 
+create_interactive_table <- function(df, displaytext = "content_html") {
 
-#' Add highlighting CSS to reactable
-#'
-#' Convenience function to inject policy highlighting CSS into a reactable
-#' HTML widget or include it in an R Markdown document.
-#'
-#' @param ... Arguments passed to generate_policy_css()
-#'
-#' @return HTML dependency or HTML string that can be included in output
-#'
-#' @examples
-#' \dontrun{
-#' # In an R Markdown document or Shiny app:
-#' library(htmltools)
-#'
-#' # Create your reactable
-#' my_table <- reactable(data, ...)
-#'
-#' # Combine with CSS
-#' browsable(tagList(
-#'   HTML(generate_policy_css()),
-#'   my_table
-#' ))
-#' }
-#'
-#' @export
-add_policy_css_to_output <- function(...) {
-  css_string <- generate_policy_css(...)
-  htmltools::HTML(css_string)
-}
+  # Get the column name as a string
+  display_col <- displaytext
 
-# ------------------------------------------------------------------------------
-# Create Interactive Table with Policy Filtering
-# ------------------------------------------------------------------------------
-create_interactive_table <- function(df, displaytext = content_html) {
   # Prepare data
   df_display <- df %>%
     mutate(
       wp_policies_str = map_chr(wp_policies, ~ {
-        # .x is the character vector of policies for this row
+        if (length(.x) == 0) return("")
         links <- sprintf(
           '<a href="https://wikipedia.org/wiki/%s" target="_blank">%s</a>',
           .x, .x
         )
         paste(links, collapse = ", ")
-      }),
-      row_collapsed = FALSE  # Track collapse state
+      })
     ) %>%
-    select(title, pageid, timestamp, wp_policies_str, wp_policies, ensym(displaytext))
+    select(title, pageid, timestamp, wp_policies_str, wp_policies, all_of(display_col))
 
-  reactable(
-    df_display,
-    columns = list(
-      pageid = colDef(
-        name = "Page ID",
-        width = 50
-      ),
-      title = colDef(
-        name = "Title",
-        width = 100,
-        cell = function(value, index) {
-          pageid <- df_display$pageid[index]
-          sprintf('<a href="https://en.wikipedia.org/?curid=%s" target="_blank">%s</a>',
-                  pageid, value)
-        },
-        html = TRUE
-      ),
-      timestamp = colDef(
-        name = "Date",
-        width = 50,
-        format = colFormat(datetime = TRUE)
-      ),
-      wp_policies_str = colDef(
-        name = "WP Policies",
-        width = 150,
-        html = TRUE,
-        filterable = TRUE,
-        filterMethod = JS("
-          function(rows, columnId, filterValue) {
-            return rows.filter(function(row) {
-              return row.values[columnId].toLowerCase().includes(filterValue.toLowerCase())
-            })
-          }
-        ")
-      ),
-      wp_policies = colDef(show = FALSE),
-      content_html = colDef(
-        name = "Content",
-        html = TRUE,
-        minWidth = 800,
-        cell = function(value, index) {
-          # Create collapsible content
-          sprintf('
-            <div class="content-container">
-              <button onclick="this.nextElementSibling.classList.toggle(\'collapsed\')"
-                      style="margin-bottom: 10px; padding: 5px 10px; cursor: pointer;">
-                Toggle Content
-              </button>
+  # Build column definitions dynamically
+  col_defs <- list(
+    pageid = colDef(
+      name = "Page ID",
+      width = 50
+    ),
+    title = colDef(
+      name = "Title",
+      width = 100,
+      cell = function(value, index) {
+        pageid <- df_display$pageid[index]
+        sprintf('<a href="https://en.wikipedia.org/?curid=%s" target="_blank">%s</a>',
+                pageid, value)
+      },
+      html = TRUE
+    ),
+    timestamp = colDef(
+      name = "Date",
+      width = 50,
+      format = colFormat(datetime = TRUE)
+    ),
+    wp_policies_str = colDef(
+      name = "WP Policies",
+      width = 150,
+      html = TRUE,
+      filterable = TRUE,
+      filterMethod = JS("
+        function(rows, columnId, filterValue) {
+          return rows.filter(function(row) {
+            return row.values[columnId].toLowerCase().includes(filterValue.toLowerCase())
+          })
+        }
+      ")
+    ),
+    wp_policies = colDef(show = FALSE)
+  )
+
+  # Add the display content column dynamically (use <- not =)
+  col_defs[[display_col]] <- colDef(
+    name = "Content",
+    html = TRUE,
+    minWidth = 800,
+    cell = function(value, index) {
+      if (is.na(value) || value == "") {
+        return('<div style="color: #999; font-style: italic;">No content available</div>')
+      }
+
+      # If content already has content-box wrapper, use as-is
+      if (str_detect(value, "content-box")) {
+        sprintf('
+          <div class="content-container">
+            <button onclick="this.nextElementSibling.classList.toggle(\'collapsed\')"
+                    style="margin-bottom: 10px; padding: 5px 10px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px;">
+              Toggle Content
+            </button>
+            <div class="collapsible-content">
+              %s
+            </div>
+          </div>
+          <style>
+            .collapsed { display: none; }
+          </style>
+        ', value)
+      } else {
+        # Add content-box wrapper if not present
+        sprintf('
+          <div class="content-container">
+            <button onclick="this.nextElementSibling.classList.toggle(\'collapsed\')"
+                    style="margin-bottom: 10px; padding: 5px 10px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px;">
+              Toggle Content
+            </button>
+            <div class="collapsible-content">
               <div class="content-box" style="max-height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px;">
                 %s
               </div>
             </div>
-            <style>
-              .collapsed { display: none; }
-            </style>
-          ', value)
-        }
-      )
-    ),
-    # Add CSS styles here for the whole table
+          </div>
+          <style>
+            .collapsed { display: none; }
+          </style>
+        ', value)
+      }
+    }
+  )
+
+  reactable(
+    df_display,
+    columns = col_defs,
     theme = reactableTheme(
       style = list(
         ".wp-policy-link" = list(
-          backgroundColor = "yellow",
+          backgroundColor = "#fff3cd",
           fontWeight = "bold",
           padding = "2px 4px",
-          borderRadius = "3px"
-        ))),
+          borderRadius = "3px",
+          border = "1px solid #ffc107"
+        )
+      )
+    ),
     searchable = TRUE,
     filterable = TRUE,
     pagination = TRUE,
-    defaultPageSize = 250,
+    defaultPageSize = 25,
+    showPageSizeOptions = TRUE,
+    pageSizeOptions = c(10, 25, 50, 100),
     highlight = TRUE,
     compact = TRUE,
     defaultColDef = colDef(
@@ -201,6 +203,7 @@ create_interactive_table <- function(df, displaytext = content_html) {
     )
   )
 }
+
 #
 # browsable(tagList(
 #   HTML(generate_policy_css()),    # CSS styles

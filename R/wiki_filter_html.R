@@ -270,87 +270,265 @@ wiki_filter_html <- function(html,
 }
 
 
-#' Remove HTML sections that do NOT contain WP policy links (stringr method - FAST)
-#'
-#' Uses regex-based text splitting to remove sections without policy links.
-#' Faster than rvest and preserves HTML structure well for Wikipedia HTML.
+#' Filter HTML to keep only sections containing Wikipedia policy links
 #'
 #' @param html Character vector of HTML content
-#' @param section_pattern Regex pattern to identify section starts (default matches mw-heading divs)
 #' @param policy_pattern Regex pattern to identify policy links (default: "wp-policy-link")
+#' @param keep_wrapper Logical, whether to keep outer wrapper divs (default: TRUE)
 #'
 #' @return Character vector of HTML with non-policy sections removed
 #'
 #' @details
 #' This function:
-#' 1. Splits HTML by section div pattern (keeping the delimiter)
-#' 2. Each "section" includes the heading div and all content until the next heading
-#' 3. REMOVES sections that do NOT contain policy_pattern
-#' 4. Preserves HTML structure before first section and between kept sections
-#' 5. Much faster than rvest
+#' 1. Identifies top-level discussion sections (mw-heading divs)
+#' 2. For each section, checks if it or its nested replies contain policy links
+#' 3. Removes entire sections that don't contain any policy references
+#' 4. Preserves HTML structure, including nested replies and formatting
+#' 5. Keeps the outer wrapper div for proper rendering
+#'
+#' The function works by:
+#' - Finding section boundaries using heading markers
+#' - Including all nested content within each section
+#' - Filtering based on policy link presence in the entire section tree
 #'
 #' @examples
 #' \dontrun{
 #' # Single HTML string
-#' filtered <- remove_non_policy_sections_stringr(html_content)
+#' filtered <- wiki_filter_text(html_content)
 #'
 #' # In a dplyr pipeline
 #' df <- df %>%
-#'   mutate(content_filtered = remove_non_policy_sections_stringr(content_html))
+#'   mutate(content_filtered = wiki_filter_text(content_html))
 #' }
 #'
 #' @export
 wiki_filter_text <- function(html,
-                                               section_pattern = '<div class="[^"]*mw-heading[^"]*"',
-                                               policy_pattern = 'class="[^"]*wp-policy-link[^"]*"') {
+                             policy_pattern = 'wp-policy-link',
+                             keep_wrapper = TRUE) {
+
   map_chr(html, function(single_html) {
     if (is.na(single_html) || single_html == "") return("")
 
-    # Find the first section heading
-    first_section <- str_locate(single_html, section_pattern)[1, "start"]
+    # Pattern to match top-level section headings
+    # These are the main discussion threads
+    heading_pattern <- '<div class="[^"]*mw-heading[^"]*mw-heading2[^"]*"[^>]*>'
 
-    # Extract content before first section (if any) - this gets kept
-    preamble <- if (!is.na(first_section) && first_section > 1) {
-      str_sub(single_html, 1, first_section - 1)
-    } else {
-      ""
+    # Find all heading positions
+    heading_starts <- str_locate_all(single_html, heading_pattern)[[1]]
+
+    if (nrow(heading_starts) == 0) {
+      # No sections found - check if whole content has policies
+      if (str_detect(single_html, policy_pattern)) {
+        return(single_html)
+      } else {
+        # Extract and return just the wrapper
+        wrapper_match <- str_match(single_html, '^(<div[^>]*mw-parser-output[^>]*>).*')
+        if (!is.na(wrapper_match[1, 2]) && keep_wrapper) {
+          return(paste0(wrapper_match[1, 2], "</div>"))
+        }
+        return("")
+      }
     }
 
-    # Extract the part with sections
-    sections_part <- if (!is.na(first_section)) {
-      str_sub(single_html, first_section, nchar(single_html))
-    } else {
-      single_html
+    # Extract wrapper (everything before first heading)
+    first_heading_start <- heading_starts[1, "start"]
+    wrapper <- str_sub(single_html, 1, first_heading_start - 1)
+
+    # Extract closing wrapper tags (everything after last section)
+    # Look for closing </div> tags at the end
+    closing_tags <- str_extract(single_html, "</div>\\s*(?:<!--[^>]*-->\\s*)?</div>\\s*$")
+    if (is.na(closing_tags)) {
+      closing_tags <- "" #"</div>"
     }
 
-    # Split by section pattern, keeping the delimiter as part of each section
-    sections <- str_split(sections_part, paste0("(?=", section_pattern, ")"))[[1]]
+    # Define section boundaries
+    section_boundaries <- c(
+      heading_starts[, "start"],
+      nchar(single_html) + 1  # End of document
+    )
 
-    # Remove empty sections
-    sections <- sections[nchar(sections) > 0]
+    # Extract each section and check for policy links
+    sections_to_keep <- list()
 
-    if (length(sections) == 0) {
-      # No sections found, return original
-      return(single_html)
+    for (i in seq_len(nrow(heading_starts))) {
+      section_start <- section_boundaries[i]
+      section_end <- section_boundaries[i + 1] - 1
+
+      section_content <- str_sub(single_html, section_start, section_end)
+
+      # Keep section if it contains policy links
+      if (str_detect(section_content, policy_pattern)) {
+        sections_to_keep <- c(sections_to_keep, list(section_content))
+      }
     }
 
-    # Keep only sections containing policy links
-    sections_with_policy <- sections[str_detect(sections, policy_pattern)]
-
-    # Reconstruct HTML: preamble + filtered sections
-    result_parts <- c()
-    if (nchar(preamble) > 0) {
-      result_parts <- c(result_parts, preamble)
-    }
-    if (length(sections_with_policy) > 0) {
-      result_parts <- c(result_parts, paste(sections_with_policy, collapse = ""))
+    # Reconstruct HTML
+    if (length(sections_to_keep) == 0) {
+      # No sections with policies - return empty wrapper
+      if (keep_wrapper) {
+        return(paste0(wrapper, closing_tags))
+      } else {
+        return("")
+      }
     }
 
-    if (length(result_parts) == 0) {
-      return(preamble)  # Return just preamble if no sections have policies
-    }
+    # Combine kept sections
+    filtered_sections <- paste(sections_to_keep, collapse = "\n")
 
-    paste(result_parts, collapse = "")
+    # Return reconstructed HTML
+    paste0(wrapper, filtered_sections, closing_tags)
   })
 }
 
+#' Filter Wikipedia talk page HTML to keep only sections with policy discussions
+#'
+#' @param html Character vector of HTML content from Wikipedia talk pages
+#' @param policy_patterns Vector of patterns to match policies
+#' @param preserve_wrapper Logical, whether to wrap output in content-box div
+#' @param min_policy_mentions Minimum number of policy mentions to keep section (default: 1)
+#'
+#' @return Character vector of filtered HTML
+#'
+#' @export
+wiki_filter_policy_sections <- function(html,
+                                        policy_patterns = NULL,
+                                        preserve_wrapper = TRUE,
+                                        min_policy_mentions = 1) {
+
+  # Default patterns - look for policies in multiple ways
+  if (is.null(policy_patterns)) {
+    policy_patterns <- c(
+      'class="[^"]*wp-policy-link[^"]*"',  # Policy link class
+      'data-policy="[^"]+"',                # Data attribute
+      '\\bWP:[A-Z][A-Z0-9]+\\b',           # WP:SHORTCUT in text
+      '\\bMEDRS\\b',                        # Common policy names in ANY context
+      '\\bNOTNEWS\\b',
+      '\\bNPOV\\b',
+      '\\bVERIFY\\b',
+      '\\b(?:WP:)?RS\\b'
+    )
+  }
+
+  # Combine patterns
+  combined_pattern <- paste(policy_patterns, collapse = "|")
+
+  # Add content-box wrapper function
+  add_wrapper <- function(content) {
+    if (preserve_wrapper && nchar(content) > 0) {
+      paste0(
+        '<div class="content-box" style="max-height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px;">\n',
+        content,
+        '\n</div>'
+      )
+    } else {
+      content
+    }
+  }
+
+  map_chr(html, function(single_html) {
+    if (is.na(single_html) || single_html == "") return(add_wrapper(""))
+
+    # Remove existing content-box wrapper if present
+    single_html <- str_replace(single_html, '^<div class="content-box"[^>]*>\\s*', '')
+    single_html <- str_replace(single_html, '\\s*</div>\\s*$', '')
+
+    # Find section markers
+    section_pattern <- '<div class="mw-heading mw-heading2[^>]*ext-discussiontools-init-section[^>]*">'
+    section_starts <- str_locate_all(single_html, section_pattern)[[1]]
+
+    if (nrow(section_starts) == 0) {
+      # No structured sections - check whole content
+      policy_count <- str_count(single_html, combined_pattern)
+      if (policy_count >= min_policy_mentions) {
+        return(add_wrapper(single_html))
+      } else {
+        # Return just the mw-parser-output wrapper (empty)
+        wrapper_match <- str_extract(single_html, '<div class="mw-content-ltr mw-parser-output"[^>]*>')
+        if (!is.na(wrapper_match)) {
+          return(add_wrapper(paste0(wrapper_match, "\n</div>")))
+        }
+        return(add_wrapper(""))
+      }
+    }
+
+    # Find positions of all section starts
+    section_starts <- section_starts[, "start"]
+
+    # Extract everything before first section (wrapper + any preamble content)
+    preamble <- str_sub(single_html, 1, section_starts[1] - 1)
+
+    # Find the closing tags (comments + closing divs at end)
+    # Be more careful to preserve NewPP comments and structure
+    closing_pattern <- "<!-- \\nNewPP limit report.*$"
+    closing_match <- str_locate(single_html, closing_pattern)
+
+    if (!is.na(closing_match[1, "start"])) {
+      closing_start <- closing_match[1, "start"]
+      closing <- str_sub(single_html, closing_start, nchar(single_html))
+    } else {
+      # Fallback: look for final closing div
+      closing_start <- nchar(single_html) + 1
+      closing <- "\n</div>"
+    }
+
+    # Process each section
+    sections_to_keep <- list()
+
+    for (i in seq_along(section_starts)) {
+      # Determine section boundaries
+      section_start <- section_starts[i]
+      section_end <- if (i < length(section_starts)) {
+        section_starts[i + 1] - 1
+      } else {
+        closing_start - 1
+      }
+
+      # Extract section content (includes heading + all nested content)
+      section_content <- str_sub(single_html, section_start, section_end)
+
+      # Count policy mentions
+      policy_count <- str_count(section_content, combined_pattern)
+
+      # Keep if meets threshold
+      if (policy_count >= min_policy_mentions) {
+        sections_to_keep <- c(sections_to_keep, list(section_content))
+      }
+    }
+
+    # Reconstruct HTML
+    if (length(sections_to_keep) == 0) {
+      # No sections kept - return just wrapper structure
+      return(add_wrapper(paste0(preamble, closing)))
+    }
+
+    # Combine all parts
+    result <- paste0(
+      preamble,
+      paste(sections_to_keep, collapse = "\n"),
+      closing
+    )
+
+    result
+  })
+}
+
+# # Usage examples
+# filtered <- wiki_filter_policy_sections(df$content_html)
+#
+# # More strict filtering (require at least 2 policy mentions)
+# filtered_strict <- wiki_filter_policy_sections(
+#   df$content_html,
+#   min_policy_mentions = 2
+# )
+#
+# # In a pipeline
+# df_filtered <- df %>%
+#   mutate(
+#     content_filtered = wiki_filter_policy_sections(content_html),
+#     n_sections_removed = str_count(content_html, "mw-heading2") -
+#       str_count(content_filtered, "mw-heading2")
+#   )
+
+# to test
+# writeLines(filtered, "test_output.html")
+# browseURL("test_output.html")

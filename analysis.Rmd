@@ -29,6 +29,8 @@ rm(custom)
 
 ## Queries
 
+Core policies extacted from initial manual analysis. 
+
 ```{r define_queries}
 
 # ==============================================================================
@@ -231,10 +233,13 @@ results_filtered_content <- results_with_content %>%
 
 # Here idea was to remove sections that aren't relevant but it turned out harder than I wanted
 
-# results_filtered_content <- results_filtered_content %>%
-#    mutate(
-#      content_filtered = wiki_filter_text(content_html)
-#    )
+results_filtered_content <- results_filtered_content %>%
+   mutate(
+     content_filtered = wiki_filter_policy_sections(content_html, policy_patterns = 'class="[^"]*wp-policy-link[^"]*"'),
+     policies_in_filtered = map(content_filtered, wiki_extract_policies),
+     num_policies_filtered = map_int(policies_in_filtered, length)
+   ) %>%
+  dplyr::filter(num_policies_filtered > 0)
 
 saveRDS(results_filtered_content, "output/wikipedia_filtered_results.rds")
 
@@ -242,13 +247,28 @@ saveRDS(results_filtered_content, "output/wikipedia_filtered_results.rds")
 
 
 
-
 ```
+
+
+
 
 ## Policy pieces
 
+We only extract based on the initial list. But there's a much bigger list available. 
+
 ```{r policyextraction}
 
+policies_all <- results_filtered_content %>%
+  select(wp_policies) %>%
+  flatten() %>% 
+  unlist() %>% 
+  unique()
+
+policies_filtered <- results_filtered_content %>% 
+  select(policies_in_filtered) %>%
+  flatten() %>% 
+  unlist() %>% 
+  unique()
 
 # ==============================================================================
 # EXTRACT 1: Policy hierarchy to get unique policies and their sub-policy shortcuts
@@ -258,6 +278,8 @@ if(file.exists("output/policy_result.rds")){
   
   policy_use <- readRDS("output/policy_result.rds")
 
+  policy_expansive <- readRDS("output/policy_expansive.rds")
+
 } else {
   message("No existing policy hierarchy found, proceeding to create new hierarchy.")
 
@@ -266,6 +288,17 @@ if(file.exists("output/policy_result.rds")){
     build_policy_hierarchy(include_referenced = TRUE, max_depth = 1)
   
   readr::write_rds(policy_use, "output/policy_result.rds")
+  
+  policy_expansive <- policies_filtered %>% 
+    stringr::str_remove(" ") %>%
+    build_policy_hierarchy(include_referenced = TRUE, max_depth = 1)
+
+  # Your original code - this should work fine
+  policy_expansive <- policy_expansive %>% 
+    mutate(categories = map(wikitext, wiki_extract_parts, part = "category"),
+           templates = map(wikitext, wiki_extract_parts, part = "template"))
+  
+    readr::write_rds(policy_expansive, "output/policy_expansive.rds")
 
 }
 
@@ -337,7 +370,7 @@ if(file.exists("output/policy_pages_nested.rds")){
     select(pageid, page_title, sections_with_shortcuts) %>%
     unnest(sections_with_shortcuts) %>%
     # Filter to only sections with child shortcuts (or keep all if you want)
-    dplyr::filter(length(shortcuts) > 0) %>%
+    dplyr::filter(lengths(shortcuts) > 0) %>%
     # Extract HTML content for each section
     mutate(
       policy_part = map2_chr(pageid, index, ~{
@@ -345,12 +378,100 @@ if(file.exists("output/policy_pages_nested.rds")){
       })
     ) 
   
+  all_subpolicies <- all_subpolicies %>% 
+    tibble::rowid_to_column()
+  
     readr::write_rds(all_subpolicies, "output/all_subpolicies.rds")
 }
 
   
 
+
 ```
+
+## Labelling
+
+https://sjgknight.com/assets/uploads/2022/08/taxonomy_full_aug2.pdf
+
+4.1	Informant
+Competence, motivations (interests and perspective)
+
+4.2	Information
+Evidence type, available evidence, input and output ambiguity
+
+4.3	Uncertainty
+Expert pertinence, human judgement, inherent uncertainty, tentative knowledge
+
+What sources are used (informant - verification)
+For what types of claim/information (uncertainty - representation)
+With what strength of evidence (information - verification)
+
+
+```{r addpolicylabels}
+
+
+label_mapping <- tribble(
+  ~key, ~statement, ~taxonony, ~onWiki, ~policyLink, ~notes, ~subtaxonomy,
+  1, "What sources are used", "informant", "verification", c("Verifiability", "NOR", "Consensus", "Reliable sources"), "can relate to verification or representation, or their negotiation", c("competence", "motivations-interests", "motivations-perspective"),
+  2, "For what types of claim", "information", "representation", c("NPOV", "Notability", "Due weight"), "relates to the types of claims included in the encyclopedia and their representation, i.e., consensus oriented, sourced, etc.", c("evidence type", "available evidence", "input ambiguity", "output ambiguity"),
+  3, "With what strength of evidence", "uncertainty", "verification", c("MEDSCI", "MEDPOP", "MEDASSESS"), "relates to the assessment of evidence for claims, bound up with the kinds of claims that may be made/represented", c("expert pertinence", "human judgement", "inherent uncertainty", "tentative knowledge")
+)
+
+# Using the rowid, and the reactable created below. 
+
+# Target can be one of: 
+#(1) which is about the warrants for claims or verification
+# inclusion, which is about what should / should not be included, 
+#(2) representation, which is about how what is included should be representd, and 
+#(3) negotiation, which is about how the process of editing is negotiated.
+
+# The first two align broadly with the content guidelines in Wikipedia. '1' aligns also with notabilit and deletion. 
+# The third aligns with the behavioural, editing, discussions guidelines.
+
+policy_annotations <- tribble(
+  ~rowid, ~key, ~target
+  1, 1, "RS",
+  2, 3, "relates to use of up-to-date evidence",
+  3, 1, NA,
+  4, 1, "negotiation",
+  5, 1, "negotiation",
+  7, "LOWRELEVANCE", "other-relates to sourcing information",
+  8, "LOWRELEVANCE", "other-relates to sourcing information",
+  14, "evidence type", "verification",
+  15, "expert pertinence", "verification",
+  16, "competence", "verification",
+  18, "LOWRELEVANCE", "other-relates to sourcing information",
+  26, "available evidence", "verification",
+  27, "available evidence", "representation",
+  28, "evidence type", "representation",
+  39, "human judgement", "negotiation",
+  40, "human judgement", "negotiation",
+  64, "human judgement", "verification",
+  65, "expert pertinence", "verification", #competence as in, what they are competent to speak to
+  66, "LOWRELEVANCE", "other-relates to sourcing information",
+  67, "LOWRELEVANCE", "other-relates to sourcing information",
+  68, "expert pertinence", "verification",
+  70, "compentence", "verification",
+  71, "motivations", "verification",
+  72, "competence", "verification",
+  73, "competence", "verification",
+  74, "expert pertinence", "verification",
+  75, "compentence", "verification",
+  76, "competence", "verification",
+  79, "competence", "verification",
+  80, "competence", "verification",
+  82, "ambiguity", "verification",
+  83, "human judgement", "representation"
+)
+  
+  
+  
+
+# all_subpolicies <- DataEditR::data_edit(all_subpolicies)
+
+
+```
+
 
 
 ## Analysis
@@ -366,11 +487,17 @@ shared_libdir <- "output/reactable_libs"
 
 message("\n=== Creating Main Interactive Table ===\n")
 
-table_talk <- results_filtered_content %>% 
+table_talk2 <- results_filtered_content %>% 
 #    dplyr::filter(content_filtered != "") %>%
     dplyr::mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC")) %>%
     dplyr::filter(timestamp < "2023-12-31T23:59:59Z") %>%
-    create_interactive_table(displaytext = content_html)
+    create_interactive_table(displaytext = "content_html")
+
+table_talk <- results_filtered_content %>%
+#    dplyr::filter(content_filtered != "") %>%
+    dplyr::mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC")) %>%
+    dplyr::filter(timestamp < "2023-12-31T23:59:59Z") %>%
+    create_interactive_table(displaytext = "content_filtered")
 
 # export large html object
 # Save tables using shared library directory
@@ -388,7 +515,8 @@ htmlwidgets::saveWidget(
 
 # Create summary reactable
 table_policy <- all_subpolicies %>%
-  select(page_title, line, shortcuts, policy_part) %>%
+    dplyr::filter(lengths(shortcuts) > 0) %>% 
+  select(rowid, page_title, line, shortcuts, policy_part) %>%
   reactable(
     columns = list(
       page_title = colDef(
@@ -463,6 +591,15 @@ detailed <- create_detailed_policy_summary(results_filtered_content)
 detailed$overall
 detailed$by_article
 detailed$policy_cooccurrence
+
+# Policy shortcut is in my policy_pages list but not used anywhere in my data
+detailed$overall %>% 
+  filter(!Policy %in% unlist(policy_pages$shortcuts))
+
+# Policy shortcut is used in Talk page but isn't in my policy_pages list
+policy_pages %>% 
+  filter(!shortcuts %in% detailed$overall$Policy)
+
 
 # Filter to only your searched policies
 core_only <- filter_core_policies(summary, policies_core)
